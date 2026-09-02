@@ -1,74 +1,32 @@
-/**
- * Configuration management for Trillium MCP Server
- * Loads and validates environment variables using Zod
- */
-
 import { z } from 'zod';
 
-const ConfigSchema = z.object({
-  apiUrl: z.string().url().describe('Trillium ETAPI URL (must include /etapi path)'),
-  apiToken: z.string().min(1).describe('Trillium ETAPI token'),
-  permissions: z.string().default('READ').describe('Permission level: READ or READ;WRITE'),
-  verifySsl: z.boolean().default(false).describe('Verify SSL certificates'),
+const configSchema = z.object({
+  apiUrl: z.url().refine((value) => new URL(value).pathname.replace(/\/+$/, '').endsWith('/etapi'), 'must end with /etapi'),
+  apiToken: z.string().min(1),
+  permissions: z.enum(['READ', 'READ;WRITE']).default('READ'),
+  verifySsl: z.boolean().default(true),
+  requestTimeoutMs: z.int().min(100).max(300_000).default(30_000),
+  maxAttachmentBytes: z.int().min(1).max(1024 ** 3).default(25 * 1024 ** 2),
 });
 
-export type Config = z.infer<typeof ConfigSchema>;
+export type Config = z.infer<typeof configSchema>;
 
-/**
- * Load and validate configuration from environment variables
- */
-function loadConfig(): Config {
-  try {
-    const config = ConfigSchema.parse({
-      apiUrl: process.env.TRILLIUM_API_URL,
-      apiToken: process.env.TRILLIUM_API_TOKEN,
-      permissions: process.env.TRILLIUM_PERMISSIONS || 'READ',
-      verifySsl: process.env.VERIFY_SSL === 'true',
-    });
-
-    // Validate API URL includes /etapi path
-    if (!config.apiUrl.includes('/etapi')) {
-      throw new Error('TRILLIUM_API_URL must include /etapi path (e.g., http://localhost:8080/etapi)');
-    }
-
-    return config;
-  } catch (error) {
-    console.error('\n❌ Configuration Error\n');
-    console.error('Missing required environment variables. Please create a .env file with:');
-    console.error('');
-    console.error('  TRILLIUM_API_URL=http://localhost:8080/etapi');
-    console.error('  TRILLIUM_API_TOKEN=your-etapi-token-here');
-    console.error('  TRILLIUM_PERMISSIONS=READ');
-    console.error('');
-    console.error('See INSTALLATION.md for detailed setup instructions.');
-    console.error('');
-
-    if (error instanceof z.ZodError) {
-      error.issues.forEach((err: z.ZodIssue) => {
-        console.error(`  - ${err.path.join('.')}: ${err.message}`);
-      });
-    } else if (error instanceof Error) {
-      console.error('Error:', error.message);
-    }
-    console.error('');
-
-    process.exit(1);
-  }
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const verifySsl = env.TRILLIUM_VERIFY_SSL ?? env.VERIFY_SSL;
+  return configSchema.parse({
+    apiUrl: env.TRILLIUM_API_URL,
+    apiToken: env.TRILLIUM_API_TOKEN,
+    permissions: env.TRILLIUM_PERMISSIONS || 'READ',
+    verifySsl: verifySsl === undefined ? true : verifySsl.toLowerCase() !== 'false',
+    requestTimeoutMs: env.TRILLIUM_REQUEST_TIMEOUT_MS ? Number(env.TRILLIUM_REQUEST_TIMEOUT_MS) : undefined,
+    maxAttachmentBytes: env.TRILLIUM_MAX_ATTACHMENT_BYTES ? Number(env.TRILLIUM_MAX_ATTACHMENT_BYTES) : undefined,
+  });
 }
 
-/**
- * Check if READ permission is enabled
- */
 export function hasReadPermission(config: Config): boolean {
-  return config.permissions.includes('READ');
+  return config.permissions === 'READ' || config.permissions === 'READ;WRITE';
 }
 
-/**
- * Check if WRITE permission is enabled
- */
 export function hasWritePermission(config: Config): boolean {
-  return config.permissions.includes('WRITE');
+  return config.permissions === 'READ;WRITE';
 }
-
-// Export singleton config instance
-export const config = loadConfig();

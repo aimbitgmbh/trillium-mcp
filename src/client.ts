@@ -1,379 +1,148 @@
-/**
- * Trillium API Client
- * Handles all communication with the Trillium ETAPI
- */
-
+import { Agent, fetch, type Dispatcher } from 'undici';
 import type { Config } from './config.js';
-import type {
-  Note,
-  CreateNoteDef,
-  NoteWithBranch,
-  Branch,
-  Attribute,
-  Attachment,
-  SearchResponse,
-  AppInfo,
-} from './types.js';
+import type { AppInfo, Attachment, Attribute, Branch, CreateNoteDef, Note, NoteWithBranch, RecentChange, Revision, SearchResponse } from './types.js';
+
+type ResponseMode = 'json' | 'text' | 'binary' | 'void';
+type RequestBody = string | Buffer | Record<string, unknown>;
+
+export class TrilliumApiError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(`Trillium ETAPI error (${status}): ${message}`);
+    this.name = 'TrilliumApiError';
+  }
+}
 
 export class TrilliumClient {
-  private apiUrl: string;
-  private apiToken: string;
-  private verifySsl: boolean;
+  private readonly apiUrl: string;
+  private readonly apiToken: string;
+  private readonly timeoutMs: number;
+  private readonly maxAttachmentBytes: number;
+  private readonly dispatcher: Dispatcher;
 
-  constructor(config: Config) {
+  constructor(config: Config, dispatcher?: Dispatcher) {
+    this.apiUrl = config.apiUrl.replace(/\/+$/, '');
     this.apiToken = config.apiToken;
-    this.apiUrl = config.apiUrl.replace(/\/$/, ''); // Remove trailing slash
-    this.verifySsl = config.verifySsl;
+    this.timeoutMs = config.requestTimeoutMs;
+    this.maxAttachmentBytes = config.maxAttachmentBytes;
+    this.dispatcher = dispatcher ?? new Agent({
+      connect: { rejectUnauthorized: config.verifySsl },
+      pipelining: 0,
+      keepAliveTimeout: 1,
+      keepAliveMaxTimeout: 1,
+    });
   }
 
-  /**
-   * Generic request handler for Trillium ETAPI
-   */
-  private async request<T>(
-    method: string,
-    path: string,
-    body?: any,
-    isTextResponse = false
-  ): Promise<T> {
-    const url = `${this.apiUrl}${path}`;
+  async close(): Promise<void> {
+    if ('close' in this.dispatcher && typeof this.dispatcher.close === 'function') await this.dispatcher.close();
+  }
 
-    const headers: Record<string, string> = {
-      'Authorization': `Bearer ${this.apiToken}`,
-    };
+  private id(value: string): string { return encodeURIComponent(value); }
+  private isRetryableTransportError(error: unknown): boolean {
+    const candidate = error as { code?: string; cause?: { code?: string } };
+    const code = candidate?.cause?.code ?? candidate?.code;
+    return ['UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'ECONNRESET', 'EPIPE', 'ECONNREFUSED'].includes(code ?? '');
+  }
 
-    // Set Content-Type based on body type
-    if (body !== undefined) {
-      if (typeof body === 'string') {
-        // String content (e.g., note content) requires text/plain
-        headers['Content-Type'] = 'text/plain; charset=utf-8';
-      } else if (typeof body === 'object') {
-        // JSON payloads require application/json
-        headers['Content-Type'] = 'application/json';
-      }
-    }
-
-    const options: RequestInit = {
-      method,
-      headers,
-    };
-
-    if (body !== undefined) {
-      options.body = typeof body === 'string' ? body : JSON.stringify(body);
-    }
-
-    // Note: In Node.js 18+, fetch doesn't support rejectUnauthorized directly
-    // For self-signed certs, you may need to use NODE_TLS_REJECT_UNAUTHORIZED=0
-    // or use a custom agent with undici or https module
-
-    try {
-      const response = await fetch(url, options);
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Trillium API error (${response.status}): ${errorText || response.statusText}`
-        );
-      }
-
-      if (isTextResponse) {
-        return (await response.text()) as T;
-      }
-
-      // Handle empty responses
-      const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        return '' as T;
-      }
-
-      return (await response.json()) as T;
-    } catch (error) {
-      if (error instanceof Error) {
-        console.error(`API request failed: ${error.message}`);
+  private async request<T>(method: string, path: string, body?: RequestBody, mode: ResponseMode = 'json', contentType?: string): Promise<T> {
+    const attempts = method === 'GET' ? 2 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const headers: Record<string, string> = { Authorization: `Bearer ${this.apiToken}` };
+        let requestBody: string | Buffer | undefined;
+        if (body !== undefined) {
+          if (Buffer.isBuffer(body)) {
+            requestBody = body;
+            headers['Content-Type'] = contentType ?? 'application/octet-stream';
+          } else if (typeof body === 'string') {
+            requestBody = body;
+            headers['Content-Type'] = contentType ?? 'text/plain; charset=utf-8';
+          } else {
+            requestBody = JSON.stringify(body);
+            headers['Content-Type'] = 'application/json';
+          }
+        }
+        const response = await fetch(`${this.apiUrl}${path}`, {
+          method, headers, body: requestBody, dispatcher: this.dispatcher, signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        if (!response.ok) {
+          const errorBody = (await response.text()).slice(0, 4_096);
+          throw new TrilliumApiError(response.status, errorBody || response.statusText);
+        }
+        if (mode === 'void' || response.status === 204) return undefined as T;
+        if (mode === 'text') return await response.text() as T;
+        if (mode === 'binary') return Buffer.from(await response.arrayBuffer()) as T;
+        return await response.json() as T;
+      } catch (error) {
+        if (attempt < attempts && !(error instanceof TrilliumApiError) && this.isRetryableTransportError(error)) continue;
         throw error;
       }
-      throw new Error('Unknown error occurred during API request');
+    }
+    throw new Error('Unreachable request state');
+  }
+
+  getAppInfo(): Promise<AppInfo> { return this.request('GET', '/app-info'); }
+  searchNotes(params: { search: string; fastSearch?: boolean; includeArchivedNotes?: boolean; ancestorNoteId?: string; ancestorDepth?: string; orderBy?: string; orderDirection?: 'asc' | 'desc'; limit?: number; debug?: boolean }): Promise<SearchResponse> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) if (value !== undefined) query.set(key, String(value));
+    return this.request('GET', `/notes?${query}`);
+  }
+  getNote(id: string): Promise<Note> { return this.request('GET', `/notes/${this.id(id)}`); }
+  updateNote(id: string, value: Partial<Note>): Promise<Note> { return this.request('PATCH', `/notes/${this.id(id)}`, value); }
+  deleteNote(id: string): Promise<void> { return this.request('DELETE', `/notes/${this.id(id)}`, undefined, 'void'); }
+  undeleteNote(id: string): Promise<void> { return this.request('POST', `/notes/${this.id(id)}/undelete`, undefined, 'void'); }
+  getNoteContent(id: string): Promise<string> { return this.request('GET', `/notes/${this.id(id)}/content`, undefined, 'text'); }
+  updateNoteContent(id: string, content: string): Promise<void> { return this.request('PUT', `/notes/${this.id(id)}/content`, content, 'void'); }
+  createNote(value: CreateNoteDef): Promise<NoteWithBranch> { return this.request('POST', '/create-note', value as unknown as Record<string, unknown>); }
+  getNoteHistory(params: { ancestorNoteId?: string; limit?: number }): Promise<RecentChange[]> {
+    const query = new URLSearchParams();
+    if (params.ancestorNoteId) query.set('ancestorNoteId', params.ancestorNoteId);
+    if (params.limit) query.set('limit', String(params.limit));
+    return this.request('GET', `/notes/history?${query}`);
+  }
+  listNoteRevisions(id: string): Promise<Revision[]> { return this.request('GET', `/notes/${this.id(id)}/revisions`); }
+  createNoteRevision(id: string, description?: string): Promise<void> { return this.request('POST', `/notes/${this.id(id)}/revision`, description === undefined ? undefined : { description }, 'void'); }
+  getRevision(id: string): Promise<Revision> { return this.request('GET', `/revisions/${this.id(id)}`); }
+  getRevisionContent(id: string, binary = false): Promise<string | Buffer> { return this.request('GET', `/revisions/${this.id(id)}/content`, undefined, binary ? 'binary' : 'text'); }
+
+  createBranch(value: { noteId: string; parentNoteId: string; prefix?: string; notePosition?: number; isExpanded?: boolean }): Promise<Branch> { return this.request('POST', '/branches', value); }
+  getBranch(id: string): Promise<Branch> { return this.request('GET', `/branches/${this.id(id)}`); }
+  updateBranch(id: string, value: Partial<Branch>): Promise<Branch> { return this.request('PATCH', `/branches/${this.id(id)}`, value); }
+  deleteBranch(id: string): Promise<void> { return this.request('DELETE', `/branches/${this.id(id)}`, undefined, 'void'); }
+  createAttribute(value: { noteId: string; type: 'label' | 'relation'; name: string; value: string; position?: number; isInheritable?: boolean }): Promise<Attribute> { return this.request('POST', '/attributes', value); }
+  getAttribute(id: string): Promise<Attribute> { return this.request('GET', `/attributes/${this.id(id)}`); }
+  updateAttribute(id: string, value: Partial<Attribute>): Promise<Attribute> { return this.request('PATCH', `/attributes/${this.id(id)}`, value); }
+  deleteAttribute(id: string): Promise<void> { return this.request('DELETE', `/attributes/${this.id(id)}`, undefined, 'void'); }
+
+  listNoteAttachments(id: string): Promise<Attachment[]> { return this.request('GET', `/notes/${this.id(id)}/attachments`); }
+  assertAttachmentSize(size?: number): void {
+    if (size !== undefined && size > this.maxAttachmentBytes) throw new Error(`Attachment exceeds ${this.maxAttachmentBytes} byte limit`);
+  }
+  getAttachment(id: string): Promise<Attachment> { return this.request('GET', `/attachments/${this.id(id)}`); }
+  getAttachmentContent(id: string): Promise<Buffer> { return this.request('GET', `/attachments/${this.id(id)}/content`, undefined, 'binary'); }
+  updateAttachment(id: string, value: Partial<Attachment>): Promise<Attachment> { return this.request('PATCH', `/attachments/${this.id(id)}`, value); }
+  deleteAttachment(id: string): Promise<void> { return this.request('DELETE', `/attachments/${this.id(id)}`, undefined, 'void'); }
+  updateAttachmentContent(id: string, content: Buffer, mime = 'application/octet-stream'): Promise<void> {
+    this.assertAttachmentSize(content.length);
+    return this.request('PUT', `/attachments/${this.id(id)}/content`, content, 'void', mime);
+  }
+  async createAttachment(value: { ownerId: string; role: string; mime: string; title: string; content: Buffer; position?: number }): Promise<Attachment> {
+    this.assertAttachmentSize(value.content.length);
+    const metadata: Record<string, unknown> = { ownerId: value.ownerId, role: value.role, mime: value.mime, title: value.title };
+    if (value.position !== undefined) metadata.position = value.position;
+    const created = await this.request<Attachment>('POST', '/attachments', metadata);
+    try {
+      await this.updateAttachmentContent(created.attachmentId, value.content, value.mime);
+      return await this.getAttachment(created.attachmentId);
+    } catch (error) {
+      try { await this.deleteAttachment(created.attachmentId); } catch { /* keep the upload error */ }
+      throw error;
     }
   }
 
-  // ===== APP INFO =====
-
-  /**
-   * Get application information
-   */
-  async getAppInfo(): Promise<AppInfo> {
-    return this.request<AppInfo>('GET', '/app-info');
-  }
-
-  // ===== NOTES =====
-
-  /**
-   * Search notes using Trilium query language
-   */
-  async searchNotes(params: {
-    search: string;
-    fastSearch?: boolean;
-    includeArchivedNotes?: boolean;
-    ancestorNoteId?: string;
-    ancestorDepth?: string;
-    orderBy?: string;
-    orderDirection?: 'asc' | 'desc';
-    limit?: number;
-    debug?: boolean;
-  }): Promise<SearchResponse> {
-    const queryParams = new URLSearchParams();
-    queryParams.append('search', params.search);
-
-    if (params.fastSearch !== undefined) queryParams.append('fastSearch', String(params.fastSearch));
-    if (params.includeArchivedNotes !== undefined) queryParams.append('includeArchivedNotes', String(params.includeArchivedNotes));
-    if (params.ancestorNoteId) queryParams.append('ancestorNoteId', params.ancestorNoteId);
-    if (params.ancestorDepth) queryParams.append('ancestorDepth', params.ancestorDepth);
-    if (params.orderBy) queryParams.append('orderBy', params.orderBy);
-    if (params.orderDirection) queryParams.append('orderDirection', params.orderDirection);
-    if (params.limit !== undefined) queryParams.append('limit', String(params.limit));
-    if (params.debug !== undefined) queryParams.append('debug', String(params.debug));
-
-    return this.request<SearchResponse>('GET', `/notes?${queryParams.toString()}`);
-  }
-
-  /**
-   * Get note metadata by ID
-   */
-  async getNote(noteId: string): Promise<Note> {
-    return this.request<Note>('GET', `/notes/${noteId}`);
-  }
-
-  /**
-   * Update note metadata
-   */
-  async updateNote(noteId: string, updates: Partial<Note>): Promise<Note> {
-    return this.request<Note>('PATCH', `/notes/${noteId}`, updates);
-  }
-
-  /**
-   * Delete a note
-   */
-  async deleteNote(noteId: string): Promise<void> {
-    await this.request<void>('DELETE', `/notes/${noteId}`);
-  }
-
-  /**
-   * Get note content
-   */
-  async getNoteContent(noteId: string): Promise<string> {
-    return this.request<string>('GET', `/notes/${noteId}/content`, undefined, true);
-  }
-
-  /**
-   * Update note content
-   */
-  async updateNoteContent(noteId: string, content: string): Promise<void> {
-    await this.request<void>('PUT', `/notes/${noteId}/content`, content);
-  }
-
-  /**
-   * Create a new note
-   */
-  async createNote(noteDef: CreateNoteDef): Promise<NoteWithBranch> {
-    return this.request<NoteWithBranch>('POST', '/create-note', noteDef);
-  }
-
-  // ===== BRANCHES =====
-
-  /**
-   * Create a branch (place note in tree)
-   */
-  async createBranch(branchDef: {
-    noteId: string;
-    parentNoteId: string;
-    prefix?: string;
-    notePosition?: number;
-    isExpanded?: boolean;
-  }): Promise<Branch> {
-    return this.request<Branch>('POST', '/branches', branchDef);
-  }
-
-  /**
-   * Get branch by ID
-   */
-  async getBranch(branchId: string): Promise<Branch> {
-    return this.request<Branch>('GET', `/branches/${branchId}`);
-  }
-
-  /**
-   * Update branch
-   */
-  async updateBranch(branchId: string, updates: Partial<Branch>): Promise<Branch> {
-    return this.request<Branch>('PATCH', `/branches/${branchId}`, updates);
-  }
-
-  /**
-   * Delete branch (remove note from parent)
-   */
-  async deleteBranch(branchId: string): Promise<void> {
-    await this.request<void>('DELETE', `/branches/${branchId}`);
-  }
-
-  // ===== ATTRIBUTES =====
-
-  /**
-   * Create an attribute (label or relation)
-   */
-  async createAttribute(attrDef: {
-    noteId: string;
-    type: 'label' | 'relation';
-    name: string;
-    value: string;
-    position?: number;
-    isInheritable?: boolean;
-  }): Promise<Attribute> {
-    return this.request<Attribute>('POST', '/attributes', attrDef);
-  }
-
-  /**
-   * Get attribute by ID
-   */
-  async getAttribute(attributeId: string): Promise<Attribute> {
-    return this.request<Attribute>('GET', `/attributes/${attributeId}`);
-  }
-
-  /**
-   * Update attribute
-   */
-  async updateAttribute(attributeId: string, updates: Partial<Attribute>): Promise<Attribute> {
-    return this.request<Attribute>('PATCH', `/attributes/${attributeId}`, updates);
-  }
-
-  /**
-   * Delete attribute
-   */
-  async deleteAttribute(attributeId: string): Promise<void> {
-    await this.request<void>('DELETE', `/attributes/${attributeId}`);
-  }
-
-  // ===== ATTACHMENTS =====
-
-  /**
-   * Create an attachment
-   */
-  async createAttachment(attachmentDef: {
-    ownerId: string;
-    role: string;
-    mime: string;
-    title: string;
-    content: string | Buffer;
-    position?: number;
-  }): Promise<Attachment> {
-    // First create the attachment metadata
-    const metadata: any = {
-      ownerId: attachmentDef.ownerId,
-      role: attachmentDef.role,
-      mime: attachmentDef.mime,
-      title: attachmentDef.title,
-    };
-
-    if (attachmentDef.position !== undefined) {
-      metadata.position = attachmentDef.position;
-    }
-
-    const attachment = await this.request<Attachment>('POST', '/attachments', metadata);
-
-    // Then upload the content
-    await this.updateAttachmentContent(attachment.attachmentId, attachmentDef.content);
-
-    return attachment;
-  }
-
-  /**
-   * Get attachment by ID
-   */
-  async getAttachment(attachmentId: string): Promise<Attachment> {
-    return this.request<Attachment>('GET', `/attachments/${attachmentId}`);
-  }
-
-  /**
-   * Update attachment metadata
-   */
-  async updateAttachment(attachmentId: string, updates: Partial<Attachment>): Promise<Attachment> {
-    return this.request<Attachment>('PATCH', `/attachments/${attachmentId}`, updates);
-  }
-
-  /**
-   * Delete attachment
-   */
-  async deleteAttachment(attachmentId: string): Promise<void> {
-    await this.request<void>('DELETE', `/attachments/${attachmentId}`);
-  }
-
-  /**
-   * Get attachment content
-   */
-  async getAttachmentContent(attachmentId: string): Promise<string> {
-    return this.request<string>('GET', `/attachments/${attachmentId}/content`, undefined, true);
-  }
-
-  /**
-   * Update attachment content
-   */
-  async updateAttachmentContent(attachmentId: string, content: string | Buffer): Promise<void> {
-    await this.request<void>('PUT', `/attachments/${attachmentId}/content`, content);
-  }
-
-  // ===== NOTE REVISIONS =====
-
-  /**
-   * Create a note revision (snapshot of current state)
-   */
-  async createNoteRevision(noteId: string): Promise<void> {
-    await this.request<void>('POST', `/notes/${noteId}/revision`);
-  }
-
-  // ===== CALENDAR =====
-
-  /**
-   * Get or create day note for a specific date
-   */
-  async getDayNote(date: string): Promise<Note> {
-    return this.request<Note>('GET', `/calendar/days/${date}`);
-  }
-
-  /**
-   * Get or create week note for a specific date
-   */
-  async getWeekNote(date: string): Promise<Note> {
-    return this.request<Note>('GET', `/calendar/weeks/${date}`);
-  }
-
-  /**
-   * Get or create month note for a specific month
-   */
-  async getMonthNote(month: string): Promise<Note> {
-    return this.request<Note>('GET', `/calendar/months/${month}`);
-  }
-
-  /**
-   * Get or create year note for a specific year
-   */
-  async getYearNote(year: string): Promise<Note> {
-    return this.request<Note>('GET', `/calendar/years/${year}`);
-  }
-
-  // ===== INBOX =====
-
-  /**
-   * Get inbox note for a specific date
-   */
-  async getInboxNote(date: string): Promise<Note> {
-    return this.request<Note>('GET', `/inbox/${date}`);
-  }
-
-  // ===== MAINTENANCE =====
-
-  /**
-   * Refresh note ordering for a parent note
-   * CRITICAL: Must be called after manually updating branch positions
-   * to trigger Trilium to actually resort the notes in the UI
-   */
-  async refreshNoteOrdering(parentNoteId: string): Promise<void> {
-    await this.request<void>('POST', `/refresh-note-ordering/${parentNoteId}`);
-  }
+  getDayNote(value: string): Promise<Note> { return this.request('GET', `/calendar/days/${this.id(value)}`); }
+  getWeekNote(value: string): Promise<Note> { return this.request('GET', `/calendar/weeks/${this.id(value)}`); }
+  getMonthNote(value: string): Promise<Note> { return this.request('GET', `/calendar/months/${this.id(value)}`); }
+  getYearNote(value: string): Promise<Note> { return this.request('GET', `/calendar/years/${this.id(value)}`); }
+  getInboxNote(value: string): Promise<Note> { return this.request('GET', `/inbox/${this.id(value)}`); }
+  refreshNoteOrdering(id: string): Promise<void> { return this.request('POST', `/refresh-note-ordering/${this.id(id)}`, undefined, 'void'); }
 }
