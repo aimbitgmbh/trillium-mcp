@@ -2,6 +2,12 @@
 
 All notable changes are documented here. This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Updated runtime dependencies and the `fast-uri` override to address published security advisories.
+- Updated dotenv to version 18 while keeping Node.js type declarations aligned with the supported Node.js 22 runtime.
+- Fixed test discovery on shells that do not expand recursive globs.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
