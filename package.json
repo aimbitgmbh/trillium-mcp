@@ -1,6 +1,6 @@
 {
   "name": "@aimbitgmbh/trillium-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Model-neutral MCP server for TriliumNext Notes via ETAPI",
   "main": "dist/index.js",
   "type": "module",

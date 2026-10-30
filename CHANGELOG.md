@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-30
+
 - Updated runtime dependencies and the `fast-uri` override to address published security advisories.
 - Updated dotenv to version 18 while keeping Node.js type declarations aligned with the supported Node.js 22 runtime.
 - Fixed test discovery on shells that do not expand recursive globs.
@@ -35,5 +37,6 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 - Initial npm release.
 
+[0.2.1]: https://github.com/aimbitgmbh/trillium-mcp/releases/tag/v0.2.1
 [0.2.0]: https://github.com/aimbitgmbh/trillium-mcp/releases/tag/v0.2.0
 [0.1.0]: https://www.npmjs.com/package/@aimbitgmbh/trillium-mcp/v/0.1.0
